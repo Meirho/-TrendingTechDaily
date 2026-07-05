@@ -168,11 +168,98 @@ async function rephraseText(request) {
     return { rephrasedText: `Rephrased: ${request.data.text} (placeholder)` };
 }
 
-// --- suggestArticleTopic (Placeholder - Implement your logic) ---
+// --- suggestArticleTopic (Implemented logic) ---
 async function suggestArticleTopic(request) { 
     if (!request.auth) throw new HttpsError("unauthenticated", "Authentication required.");
-    // TODO: Implement your suggestArticleTopic logic using Gemini
-    return { topic: "Placeholder: AI-suggested Article Topic", reason: "This is a compelling topic because..." };
+
+    logger.info(`suggestArticleTopic: Generating a topic suggestion for user ${request.auth.uid}`);
+
+    try {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        logger.error("suggestArticleTopic: GEMINI_API_KEY is not configured.");
+        return { error: true, message: "API Key not configured." };
+      }
+
+      const sdkLoaded = await loadGeminiSDK();
+      const { GoogleGenerativeAI } = getGeminiSDK();
+
+      if (!sdkLoaded || !GoogleGenerativeAI) {
+        logger.error("suggestArticleTopic: GoogleGenerativeAI SDK not loaded.");
+        throw new HttpsError("internal", "Core AI SDK (@google/generative-ai) failed to load.");
+      }
+
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash", safetySettings: getSafetySettings() });
+
+      const structuredPrompt = `
+Suggest a compelling, highly relevant news article topic in the domains of technology, finance, startups, or AI.
+The topic should be suitable for a professional news publication.
+
+Output MUST be ONLY a raw JSON object with these exact keys:
+{
+  "topic": "string, max 100 chars, a clear and engaging article topic",
+  "reason": "string, a brief 1-2 sentence explanation of why this topic is currently relevant or compelling"
+}
+
+Output ONLY the JSON object.
+`;
+
+      logger.info("suggestArticleTopic: Sending prompt to Gemini...");
+      const result = await model.generateContent(structuredPrompt);
+      const response = await result.response;
+      const rawTextResponse = response.text();
+      logger.info("suggestArticleTopic: Raw Gemini Response (first 100 chars):", rawTextResponse.substring(0, 100));
+
+      let generatedJson = {};
+      let parseErrorOccurred = false;
+      let validationErrorOccurred = false;
+      let errorMessage = "";
+
+      try {
+        let jsonText = rawTextResponse;
+        if (jsonText.includes('```json')) {
+            jsonText = jsonText.replace(/^```json\s*/, '');
+            jsonText = jsonText.replace(/\s*```\s*$/, '');
+        } else if (jsonText.startsWith('```') && jsonText.endsWith('```')) {
+             jsonText = jsonText.substring(3, jsonText.length - 3).trim();
+        }
+        const jsonMatch = jsonText.match(/(\{[\s\S]*\})/);
+        if (!jsonMatch || !jsonMatch[0]) {
+          throw new Error("No valid JSON object found in AI response.");
+        }
+        generatedJson = JSON.parse(jsonMatch[0]);
+        logger.info("suggestArticleTopic: Successfully parsed JSON from Gemini response.");
+      } catch (parseError) {
+        parseErrorOccurred = true;
+        errorMessage = "AI response was not valid JSON. Raw: " + rawTextResponse.substring(0,100);
+        logger.error("suggestArticleTopic: Failed to parse JSON.", parseError, "Raw Text:", rawTextResponse);
+      }
+
+      if (!parseErrorOccurred) {
+        if (!generatedJson.topic || !generatedJson.reason) {
+          validationErrorOccurred = true;
+          errorMessage = "AI response missing required fields (topic, reason).";
+          logger.error("suggestArticleTopic: Parsed JSON missing required fields:", generatedJson);
+        }
+      }
+
+      if (parseErrorOccurred || validationErrorOccurred) {
+        return { error: true, message: errorMessage, rawText: rawTextResponse };
+      } else {
+        return {
+          topic: getSafe(() => generatedJson.topic),
+          reason: getSafe(() => generatedJson.reason)
+        };
+      }
+    } catch (error) {
+      logger.error("suggestArticleTopic General Error Caught:", error);
+      let generalErrorMessage = error.message || "Unknown error during topic suggestion.";
+      if (error.response?.promptFeedback?.blockReason) {
+        generalErrorMessage = `Content generation blocked: ${error.response.promptFeedback.blockReason}.`;
+      }
+      return { error: true, message: generalErrorMessage };
+    }
 }
 
 // --- generateArticleImage (Logic Order UPDATED) ---
